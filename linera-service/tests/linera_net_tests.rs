@@ -1172,8 +1172,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     let account_owner2 = {
         let wallet = client1.load_wallet()?;
         let user_chain = wallet.get(chain2).unwrap();
-        let public_key = user_chain.key_pair.as_ref().unwrap().public();
-        AccountOwner::from(public_key)
+        user_chain.owner.unwrap()
     };
     // The initial accounts on chain1
     let accounts = BTreeMap::from([
@@ -2686,16 +2685,7 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
     let (mut net, client) = config.instantiate().await?;
 
     let chain1 = client.load_wallet()?.default_chain().unwrap();
-    let owner1 = AccountOwner::from(
-        client
-            .load_wallet()?
-            .get(chain1)
-            .unwrap()
-            .key_pair
-            .as_ref()
-            .unwrap()
-            .public(),
-    );
+    let owner1 = client.load_wallet()?.get(chain1).unwrap().owner.unwrap();
 
     // Create a fungible token application with 10 tokens for owner 1.
     let owner = get_fungible_account_owner(&client);
@@ -2930,8 +2920,9 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
     let owner1 = {
         let wallet = client.load_wallet()?;
         let user_chain = wallet.get(chain).unwrap();
-        user_chain.key_pair.as_ref().unwrap().public().into()
+        user_chain.owner.unwrap()
     };
+    // Generate an owner for which we don't have a priv key in the Signer.
     let owner2 = AccountPublicKey::test_key(2).into();
 
     // Make both keys owners.
@@ -2942,6 +2933,8 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
     // Make owner2 the only (super) owner.
     client.change_ownership(chain, vec![owner2], vec![]).await?;
 
+    // Switch the client to use owner2 as the preferred owner.
+    client.set_preffered_owner(chain, Some(owner2)).await?;
     // Now we're not the owner anymore.
     let result = client.change_ownership(chain, vec![], vec![owner1]).await;
     assert_matches::assert_matches!(result, Err(_));

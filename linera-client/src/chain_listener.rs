@@ -14,17 +14,17 @@ use futures::{
     FutureExt as _, StreamExt,
 };
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoHash},
+    crypto::{CryptoHash, Signer},
     data_types::Timestamp,
-    identifiers::ChainId,
+    identifiers::{AccountOwner, ChainId},
     task::NonBlockingFuture,
 };
 use linera_core::{
-    client::{AbortOnDrop, ChainClient, ChainClientError},
+    client::{AbortOnDrop, ChainClient as ContextChainClient, ChainClientError},
     node::{NotificationStream, ValidatorNodeProvider},
     worker::{Notification, Reason},
 };
-use linera_execution::{Message, OutgoingMessage, SystemMessage};
+use linera_execution::{OutgoingMessage, SystemMessage};
 use linera_storage::{Clock as _, Storage};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn, Instrument as _};
@@ -58,8 +58,8 @@ pub struct ChainListenerConfig {
     pub delay_after_ms: u64,
 }
 
-type ContextChainClient<C> =
-    ChainClient<<C as ClientContext>::ValidatorNodeProvider, <C as ClientContext>::Storage>;
+type ChainClient<C> =
+    ContextChainClient<<C as ClientContext>::ValidatorNodeProvider, <C as ClientContext>::Storage>;
 
 #[cfg_attr(not(web), async_trait, trait_variant::make(Send))]
 #[cfg_attr(web, async_trait(?Send))]
@@ -69,18 +69,20 @@ pub trait ClientContext: 'static {
 
     fn wallet(&self) -> &Wallet;
 
-    fn make_chain_client(&self, chain_id: ChainId) -> Result<ContextChainClient<Self>, Error>;
+    fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<Self>, Error>;
+
+    fn client(&self) -> &linera_core::client::Client<Self::ValidatorNodeProvider, Self::Storage>;
 
     async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<AccountSecretKey>,
+        owner: Option<AccountOwner>,
         timestamp: Timestamp,
     ) -> Result<(), Error>;
 
-    async fn update_wallet(&mut self, client: &ContextChainClient<Self>) -> Result<(), Error>;
+    async fn update_wallet(&mut self, client: &ChainClient<Self>) -> Result<(), Error>;
 
-    fn clients(&self) -> Result<Vec<ContextChainClient<Self>>, Error> {
+    fn clients(&self) -> Result<Vec<ChainClient<Self>>, Error> {
         let mut clients = vec![];
         for chain_id in &self.wallet().chain_ids() {
             clients.push(self.make_chain_client(*chain_id)?);
@@ -96,7 +98,7 @@ pub trait ClientContext: 'static {
 /// dropped.
 struct ListeningClient<C: ClientContext> {
     /// The chain client.
-    client: ContextChainClient<C>,
+    client: ChainClient<C>,
     /// The abort handle for the task that listens to the validators.
     abort_handle: AbortOnDrop,
     /// The listening task's join handle.
@@ -109,7 +111,7 @@ struct ListeningClient<C: ClientContext> {
 
 impl<C: ClientContext> ListeningClient<C> {
     fn new(
-        client: ContextChainClient<C>,
+        client: ChainClient<C>,
         abort_handle: AbortOnDrop,
         join_handle: NonBlockingFuture<()>,
         notification_stream: NotificationStream,
@@ -215,35 +217,43 @@ impl<C: ClientContext> ChainListener<C> {
     async fn add_new_chains(&mut self, hash: CryptoHash) -> Result<(), Error> {
         let block = self.storage.read_confirmed_block(hash).await?.into_block();
         let messages = block.messages().iter().flatten();
-        let new_chains = messages
-            .filter_map(|outgoing_message| {
-                if let OutgoingMessage {
-                    destination: new_id,
-                    message: Message::System(SystemMessage::OpenChain(open_chain_config)),
-                    ..
-                } = outgoing_message
-                {
-                    let owners = open_chain_config.ownership.all_owners().cloned();
-                    Some((new_id, owners.collect::<Vec<_>>()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let new_chains =
+            messages
+                .filter_map(|outgoing_message| {
+                    if let OutgoingMessage {
+                        destination: new_id,
+                        message:
+                            linera_execution::Message::System(SystemMessage::OpenChain(
+                                open_chain_config,
+                            )),
+                        ..
+                    } = outgoing_message
+                    {
+                        let owners = open_chain_config.ownership.all_owners().cloned();
+                        Some((new_id, owners.collect::<Vec<_>>()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
         if new_chains.is_empty() {
             return Ok(());
         }
         let mut new_ids = BTreeSet::new();
         let mut context_guard = self.context.lock().await;
-        for (new_id, owners) in new_chains {
-            let key_pair = owners
+        for (new_chain_id, owners) in new_chains {
+            if let Some(chain_owner) = owners
                 .iter()
-                .find_map(|owner| context_guard.wallet().key_pair_for_owner(owner));
-            if key_pair.is_some() {
+                .find(|owner| context_guard.client().signer().contains_key(owner))
+            {
                 context_guard
-                    .update_wallet_for_new_chain(*new_id, key_pair, block.header.timestamp)
+                    .update_wallet_for_new_chain(
+                        *new_chain_id,
+                        Some(*chain_owner),
+                        block.header.timestamp,
+                    )
                     .await?;
-                new_ids.insert(*new_id);
+                new_ids.insert(*new_chain_id);
             }
         }
         drop(context_guard);
@@ -403,7 +413,9 @@ impl<C: ClientContext> ChainListener<C> {
             .process_inbox_without_prepare()
             .await
         {
-            Err(ChainClientError::CannotFindKeyForChain(_)) => {}
+            Err(ChainClientError::CannotFindKeyForChain(chain_id)) => {
+                debug!(%chain_id, "Cannot find key for chain");
+            }
             Err(error) => warn!(%error, "Failed to process inbox."),
             Ok((certs, None)) => info!("Done processing inbox. {} blocks created.", certs.len()),
             Ok((certs, Some(new_timeout))) => {

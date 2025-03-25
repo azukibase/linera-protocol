@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoHash},
+    crypto::CryptoHash,
     data_types::{BlobContent, Timestamp},
-    identifiers::{BlobId, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -179,6 +179,10 @@ impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static
         unimplemented!()
     }
 
+    fn client(&self) -> &linera_core::client::Client<Self::ValidatorNodeProvider, Self::Storage> {
+        unimplemented!()
+    }
+
     fn make_chain_client(&self, _: ChainId) -> Result<ChainClient<P, S>, Error> {
         unimplemented!()
     }
@@ -186,7 +190,7 @@ impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static
     async fn update_wallet_for_new_chain(
         &mut self,
         _: ChainId,
-        _: Option<AccountSecretKey>,
+        _: Option<AccountOwner>,
         _: Timestamp,
     ) -> Result<(), Error> {
         Ok(())
