@@ -1,0 +1,135 @@
+Loading an entry from a collection cost two **sequential** round trips.
+`try_load_entry` asked
+whether the entry exists, and only then loaded the subview:
+
+```rust
+if self.context.store().contains_key(&key_index).await? {   // round trip 1
+    let view = W::load(context).await?;                     // round trip 2
+```
+
+The existence marker is `Index`-tagged and the subview's initialization
+keys are
+`Subview`-tagged, so the second read could not start until the first
+returned. The batch
+variants had the same shape: `contains_keys`, then
+`read_multi_values_bytes`.
+
+Both `ReentrantByteCollectionView` and `ByteCollectionView` were
+affected, in both their
+single-entry and batch paths — four sites in total.
+
+**The highest-frequency caller is application storage, not the chain
+state.**
+`execution_state_actor.rs` calls `state.users.try_load_entry(&id)` on
+*every* `ContainsKey`,
+`ReadValueBytes`, `ReadMultiValuesBytes`, `FindKeysByPrefix`,
+`FindKeyValuesByPrefix` and
+`WriteBatch` an application issues. `users` is a
+`ReentrantCollectionView<_, _, KeyValueStoreView<_>>` and
+`KeyValueStoreView::NUM_INIT_KEYS` is
+1, so every application storage operation goes from two sequential round
+trips to one query of
+two keys. `ChainStateView::inboxes` and `outboxes` benefit too, but far
+less often.
+
+## Proposal
+
+Read the index marker and the subview's initialization keys in one
+`read_multi_values_bytes`,
+then use the marker to decide whether to build the subview.
+
+The marker cannot be eliminated or inferred — it is what distinguishes
+an absent entry from a
+present-but-empty one. A subview that was opened and never written
+stores no bytes of its own
+(`RegisterView::pre_save` only emits a key when the register was
+assigned), so the `Index` key
+with its empty value is the sole record of membership. It can, however,
+be fetched in the same
+batch. Presence and not content is what decides, so the marker is read
+back as `Some(vec![])`
+and tested with `is_some()`.
+
+The key layout both collections share now lives in one private module,
+`views::collection_entry`: the `KeyTag` enum (which the two files
+declared identically), the
+`index_key` / `subview_key` / `subview_context` derivations, and
+`entry_keys` /
+`post_load_entry`. That also collapses 17 inline
+`base_tag_index(KeyTag::… as u8, …)` sites
+across the two files, so the derivation now has one spelling rather than
+four.
+
+`entry_keys` returns the subview context it derived rather than taking
+it as a parameter, so a
+caller cannot pass a context and short key that disagree.
+`post_load_entry` treats a short read
+as `ViewError::MissingEntries` rather than as an absent entry, since
+fewer values than keys is a
+broken store contract and not a missing entry.
+
+### Cost
+
+Never worse in round trips, and better whenever the entry exists:
+
+| | before | after |
+|---|---|---|
+| entry exists | 2 round trips (1 key, then `NUM_INIT_KEYS`) | 1 round
+trip (`1 + NUM_INIT_KEYS` keys) |
+| entry absent | 1 round trip (1 key) | 1 round trip (`1 +
+NUM_INIT_KEYS` keys) |
+
+On a miss the extra initialization keys resolve to `None`, so the cost
+is a wider batched query
+rather than an additional round trip.
+
+For the two hot **batch** callers the hit rate is 100% by construction
+and enforced:
+`chain_worker/state.rs` iterates `chain.nonempty_inboxes` and turns a
+`None` into
+`ChainError::InternalError`, and `chain.rs`'s `load_outboxes` collects
+into `Option<Vec<_>>` and
+errors with `CorruptedChainState`. Those are pure 2→1 wins with no
+widening at all.
+
+Where a miss widens most is the single-entry paths on chain state:
+`InboxStateView::NUM_INIT_KEYS` is 5 (three registers, two queues), so
+an inbox miss in
+`get_inbox_next_height` — a sender asking a receiver that has never
+heard from it — goes from 1
+key to 6. `OutboxStateView` is 2, so `get_tip_state_and_outbox_info`
+goes 1→3. Both are
+per-chain and infrequent. Note also that a batch above 99 keys is split
+by ScyllaDB's
+`read_multi_values_bytes` into concurrent sub-queries under a single
+semaphore permit.
+
+## Test Plan
+
+`test_collection_view_try_load_entries_with_absent_entries` and its
+reentrant twin cover a batch
+that mixes hits and misses with a hole in the middle — entries 1 and 5
+hold values, 3 exists but
+was never written to (index marker only), 0/2/4/6 are absent — which is
+exactly what the
+chunk-and-zip alignment has to get right, and which no existing test
+reached. They have teeth:
+moving the marker to the end of each entry's key run in `entry_keys`
+fails both.
+
+- `cargo test -p linera-views --features metrics` — 377 passing.
+- `cargo test -p linera-chain` — 80 passing; this exercises the inbox
+and outbox collections.
+- `cargo clippy --locked --all-targets --all-features --workspace` —
+clean.
+- Nightly `cargo fmt --check`.
+
+## Release Plan
+
+- Nothing to do / These changes follow the usual release cycle.
+
+Operational note for whoever deploys this: `contains_key` volume drops
+sharply and reappears as
+wider `read_multi_values_bytes` batches, so any dashboard or alert
+thresholded on
+`*_contains_key_latency` rates will shift.
